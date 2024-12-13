@@ -6,6 +6,8 @@ function App() {
   const [url, setUrl] = useState('');
   const [recommendations, setrecommendations] = useState([])
 
+  const [selectedOption, setselectedOption] = useState("")
+
   const getRecommendations = () => {
 
   }
@@ -20,7 +22,9 @@ function App() {
   return (
     <div className='main-div'>
         <div className='current-url'>{url}</div>
-        <button onClick={() => {getRecommendations}} className='action-btn'>Recommend</button>
+        <div style={{display: "flex", justifyContent: "center", alignItems: "center"}}>
+          <button onClick={() => {getRecommendations}} className='action-btn'>Recommend</button>
+        </div>
 
         <div className='recommendations-div'>
           {recommendations.map((new_folder,text) => {

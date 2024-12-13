@@ -2,6 +2,7 @@
     height: 800px;
     width: 300px;
     background-color: #0000;
+    padding: 20px;
 }
 
 .main-div h3 {
@@ -11,17 +12,19 @@
 
 .current-url {
     padding: 10px;
-    font-size: 18px;
+    font-size: 15px;
     background-color: azure;
     color: black;
-    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow-x: hidden;
     margin: 20px;
-    width: 100%;
 }
 
 .action-btn {
-    padding: 10px 15px;
+    padding: 10px;
     color: white;
+    font-size: 18px;
     background-color: coral;
 }
 
