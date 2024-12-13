@@ -1,0 +1,38 @@
+.main-div {
+    height: 800px;
+    width: 300px;
+    background-color: #0000;
+}
+
+.main-div h3 {
+    margin-top: 20px;
+    margin-bottom: 15px;
+}
+
+.current-url {
+    padding: 10px;
+    font-size: 18px;
+    background-color: azure;
+    color: black;
+    overflow: hidden;
+    margin: 20px;
+    width: 100%;
+}
+
+.action-btn {
+    padding: 10px 15px;
+    color: white;
+    background-color: coral;
+}
+
+.recommendations-div {
+    padding: 10px;
+    font-size: 15px;
+    color: black;
+    background-color: white;
+}
+
+.recommendations-div:hover {
+    color: black;
+    background-color: whitesmoke;
+}
