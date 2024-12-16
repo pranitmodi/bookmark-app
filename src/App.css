@@ -1,11 +1,12 @@
 .main-div {
     height: 800px;
     width: 300px;
-    background-color: #0000;
+    background-color: rgb(46, 46, 46);
     padding: 20px;
+    text-align: center;
 }
 
-.main-div h3 {
+.main-div h2 {
     margin-top: 20px;
     margin-bottom: 15px;
 }
@@ -18,14 +19,20 @@
     white-space: nowrap;
     text-overflow: ellipsis;
     overflow-x: hidden;
-    margin: 20px;
+    /* margin: 20px; */
 }
 
 .action-btn {
-    padding: 10px;
+    padding: 10px 15px;
     color: white;
-    font-size: 18px;
+    font-size: 15px;
+    cursor: pointer;
+    border: none;
+    outline: none;
+    font-weight: bold;
+    border-radius: 8px;
     background-color: coral;
+    margin: 15px;
 }
 
 .recommendations-div {
