@@ -46,8 +46,8 @@ function App() {
     },
   };
 
-  function fetchBookmarks() {
-    chrome.bookmarks.getTree(function(bookmarkTreeNodes) {
+  async function fetchBookmarks() {
+    await chrome.bookmarks.getTree(function(bookmarkTreeNodes) {
       const markdown = generateMarkdown(bookmarkTreeNodes);
       setFolderStructure(markdown);
     });
@@ -67,22 +67,22 @@ function App() {
   }
 
   const getRecommendations = async () => {
-    fetchBookmarks();
     const chatSession = model.startChat({
       generationConfig,
       history: [
       ],
     });
-  
+    console.log("Current folder structure: ", folderStructure);
     const result = await chatSession.sendMessage(folderStructure);
-    console.log(result.response.text());
+    console.log("Recommendations: ", result.response.text());
     setrecommendations(result.response.text());
   }
 
-  useEffect(() => {
+  useEffect(async () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       let activeTab = tabs[0];
       setUrl(activeTab.url);
+      fetchBookmarks();
     });
   }, []);
 
