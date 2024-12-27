@@ -19,18 +19,16 @@ const {
     responseSchema: {
       type: "object",
       properties: {
-        response: {
-          type: "object",
-          properties: {
-            reccomendations: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  text: {
-                    type: "string"
-                  }
-                }
+        recommendations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              add_folder: {
+                type: "boolean"
+              },
+              text: {
+                type: "string"
               }
             }
           }

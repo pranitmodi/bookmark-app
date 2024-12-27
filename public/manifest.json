@@ -1,13 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "React Chrome Extension",
+  "name": "Bookmark AI",
   "version": "1.0.0",
-  "description": "A simple React app as a Chrome extension",
+  "description": "A Chrome extension that leverages AI to help you organize your bookmarks.",
   "action": {
     "default_popup": "index.html"
   },
   "permissions": [
     "bookmarks",
     "tabs",
-    "activeTab"]
+    "activeTab",
+    "storage"],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png"
+  }
 }
