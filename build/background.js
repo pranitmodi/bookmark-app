@@ -1,51 +1,67 @@
-// Helper function to find a folder by its path
-function findFolderByPath(path, callback) {
-    const folders = path.split(' > ');
+/**
+ * Background script for Bookmark AI Assistant
+ * Handles background operations and message passing
+ */
+
+// Listen for extension installation or update
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    console.log('Bookmark AI Assistant installed');
+  } else if (details.reason === 'update') {
+    console.log('Bookmark AI Assistant updated');
+  }
+});
+
+// Listen for messages from the popup or content scripts
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log('Message received:', request);
   
-    function find(folderId, folders) {
-      if (folders.length === 0) {
-        callback(folderId);
-        return;
-      }
-  
-      const folderName = folders.shift();
-      chrome.bookmarks.getChildren(folderId, (children) => {
-        const folder = children.find(child => child.title === folderName && child.url === undefined);
-        if (folder) {
-          find(folder.id, folders);
-        } else {
-          console.error(`Folder "${folderName}" not found.`);
-          callback(null);
-        }
-      });
-    }
-  
-    find('0', folders); // Start from the root folder
+  // Handle different message types
+  if (request.action === 'getBookmarks') {
+    chrome.bookmarks.getTree((bookmarkTreeNodes) => {
+      sendResponse({ bookmarks: bookmarkTreeNodes });
+    });
+    return true; // Keep the message channel open for async response
   }
   
-  // Function to create a bookmark
-  function createBookmark(path, title, url) {
-    findFolderByPath(path, (folderId) => {
-      if (folderId) {
-        chrome.bookmarks.create({
-          parentId: folderId,
-          title: title,
-          url: url
-        }, (newBookmark) => {
-          console.log('Bookmark created:', newBookmark);
+  if (request.action === 'createBookmark') {
+    const { parentId, title, url } = request;
+    chrome.bookmarks.create({ parentId, title, url }, (newBookmark) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ 
+          success: false, 
+          error: chrome.runtime.lastError.message 
         });
       } else {
-        console.error('Folder not found, bookmark not created.');
+        sendResponse({ 
+          success: true, 
+          bookmark: newBookmark 
+        });
       }
     });
+    return true;
   }
   
-  // Listen for messages from the React app
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'createBookmark') {
-      const { path, title, url } = request;
-      createBookmark(path, title, url);
-      sendResponse({ status: 'success' });
-    }
-  });
+  if (request.action === 'createFolder') {
+    const { parentId, title } = request;
+    chrome.bookmarks.create({ parentId, title }, (newFolder) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ 
+          success: false, 
+          error: chrome.runtime.lastError.message 
+        });
+      } else {
+        sendResponse({ 
+          success: true, 
+          folder: newFolder 
+        });
+      }
+    });
+    return true;
+  }
+});
+
+// Log when the extension is loaded
+console.log('Bookmark AI Assistant background script loaded');
+
   

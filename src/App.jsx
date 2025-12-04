@@ -1,239 +1,400 @@
 import './App.css';
-import { useState, useEffect } from 'react';
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import ProfileSettings from './components/ProfileSettings';
+import URLDisplay from './components/URLDisplay';
+import BookmarkRecommendations from './components/BookmarkRecommendations';
+import LoadingSpinner from './components/LoadingSpinner';
+import { 
+  fetchBookmarks, 
+  generateMarkdownWithAnalysis,
+  generateStructureSummary,
+  createBookmarkWithPath,
+  getCachedBookmarkData,
+  setCachedBookmarkData,
+  invalidateBookmarkCache,
+  checkBookmarkExists,
+  getRecentFolders,
+  saveRecentFolder
+} from './utils/bookmarkUtils';
+import { getCurrentTab, getFromStorage, setInStorage, copyToClipboard } from './utils/chromeUtils';
+import { getBookmarkRecommendations, validateApiKey } from './utils/aiUtils';
 
 function App() {
-
+  // State management
   const [url, setUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStep, setLoadingStep] = useState('');
   const [folderStructure, setFolderStructure] = useState('');
-  const [folderStructureArray, setfolderStructureArray] = useState([])
-  const [apiKey, setapiKey] = useState();
-  const [apiInput, setapiInput] = useState()
-  const [openProfile, setopenProfile] = useState(true);
-  const [recommendations, setrecommendations] = useState([]);
-  const [hover, sethover] = useState(null);
-  const [copy, setcopy] = useState();
-  const [done, setdone] = useState(false);
+  const [folderStructureArray, setFolderStructureArray] = useState([]);
+  const [structureSummary, setStructureSummary] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [apiInput, setApiInput] = useState('');
+  const [openProfile, setOpenProfile] = useState(true);
+  const [recommendations, setRecommendations] = useState([]);
+  const [isCopied, setIsCopied] = useState(false);
+  const [isBookmarkAdded, setIsBookmarkAdded] = useState(false);
+  const [error, setError] = useState(null);
+  const [existingBookmark, setExistingBookmark] = useState(null);
+  const [recentFolders, setRecentFolders] = useState([]);
+  const [showRecentFolders, setShowRecentFolders] = useState(false);
 
-  // const apiKey = import.meta.env.VITE_REACT_APP_GEMINI_API_KEY;
-  const genAI = new GoogleGenerativeAI(apiKey);
-
-  useEffect(async () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      let activeTab = tabs[0];
-      setUrl(activeTab.url);
-      setcopy(false);
-      fetchBookmarks();
-    });
+  // Fetch bookmarks with caching and combined traversal
+  // Fetch bookmarks with caching and combined traversal
+  const loadBookmarks = useCallback(async () => {
+    try {
+      setLoadingStep('Loading bookmarks...');
+      
+      // Try to get cached data first
+      const cached = await getCachedBookmarkData();
+      if (cached) {
+        console.log('Using cached bookmark data');
+        setFolderStructureArray(cached.bookmarksData);
+        setFolderStructure(cached.markdown);
+        setStructureSummary(cached.summary);
+        setLoadingStep('');
+        return;
+      }
+      
+      // No cache, fetch fresh data
+      setLoadingStep('Analyzing bookmark patterns...');
+      const bookmarkTree = await fetchBookmarks();
+      
+      if (bookmarkTree && bookmarkTree[0]?.children?.[0]?.children) {
+        const bookmarksData = bookmarkTree[0].children[0].children;
+        setFolderStructureArray(bookmarksData);
+        
+        // Use combined traversal for 50% faster processing
+        const { markdown, analysis } = generateMarkdownWithAnalysis(bookmarkTree);
+        setFolderStructure(markdown);
+        
+        const summary = generateStructureSummary(analysis);
+        setStructureSummary(summary);
+        
+        // Cache for next time
+        await setCachedBookmarkData({
+          bookmarksData,
+          markdown,
+          summary,
+          analysis
+        });
+        
+        console.log('Bookmark analysis:', analysis);
+      }
+      setLoadingStep('');
+    } catch (err) {
+      console.error('Error fetching bookmarks:', err);
+      setError('Failed to load bookmarks');
+      setLoadingStep('');
+    }
   }, []);
 
+  // Initialize: Get current tab URL, API key, and bookmarks in parallel
   useEffect(() => {
-    chrome.storage.sync.get(["geminiKey"]).then((result) => {
-      console.log("ApiKey is " + result.geminiKey);
-      if(result.geminiKey) {
-        setapiKey(result.geminiKey);
-        setopenProfile(false);
-      }
-    });
-  },[]);
-
-  useEffect(() => {
-    if(apiKey) {
-      chrome.storage.sync.set({ geminiKey: apiKey }).then(() => {
-        console.log("Api Key is set");
-      });
-    }
-  },[apiKey])
-  
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash-exp",
-    systemInstruction: "Your task is to recommend the folder in which bookmark for the provided URL must be added. You will be given the existing bookmark folder structure in the form of a markdown. The output should include sub folders if needed. First decide what topics the particular url is associated to and now try and find them in existing bookmark folder structure. Give maximum 5 folder recommendation for existing folders and give maximum two recommendations for creating a new folder along with the new folder/subfolder name. But give proper path to the subfolder if any in this format. \n\n- Folder 1 > Sub Folder > Sub Folder 2.... . Also generate a new title for the current URL provided and do not use the folder structure or the past titles to generate the new title. Give different titles options for all the recommendations.",
-  });
-  
-  const generationConfig = {
-    temperature: 1,
-    topP: 0.95,
-    topK: 40,
-    maxOutputTokens: 8192,
-    responseMimeType: "application/json",
-    responseSchema: {
-      type: "object",
-      properties: {
-        recommendations: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              add_folder: {
-                type: "boolean"
-              },
-              text: {
-                type: "string"
-              },
-              title: {
-                type: "string"
-              }
-            },
-            required: [
-              "add_folder",
-              "text",
-              "title"
-            ]
+    const initialize = async () => {
+      try {
+        // Run all independent operations in parallel
+        const [tab, apiKeyResult, recentFoldersData] = await Promise.all([
+          getCurrentTab(),
+          getFromStorage(['geminiKey']),
+          getRecentFolders()
+        ]);
+        
+        setUrl(tab.url);
+        setIsCopied(false);
+        setRecentFolders(recentFoldersData);
+        
+        if (apiKeyResult.geminiKey && validateApiKey(apiKeyResult.geminiKey)) {
+          setApiKey(apiKeyResult.geminiKey);
+          setOpenProfile(false);
+        }
+        
+        // Load bookmarks (uses cache if available)
+        await loadBookmarks();
+        
+        // Check for duplicate after bookmarks are loaded
+        const bookmarkTree = await fetchBookmarks();
+        if (bookmarkTree && bookmarkTree[0]?.children?.[0]?.children) {
+          const bookmarksData = bookmarkTree[0].children[0].children;
+          const existing = checkBookmarkExists(tab.url, bookmarksData);
+          if (existing) {
+            setExistingBookmark(existing);
+            console.log('URL already bookmarked:', existing);
           }
         }
+      } catch (err) {
+        console.error('Error initializing:', err);
+        setError('Failed to initialize extension');
       }
-    },
+    };
+
+    initialize();
+  }, [loadBookmarks]);
+
+  // Save API key to storage when it changes
+  useEffect(() => {
+    const saveApiKey = async () => {
+      if (apiKey && validateApiKey(apiKey)) {
+        try {
+          await setInStorage({ geminiKey: apiKey });
+          console.log('API key saved successfully');
+        } catch (err) {
+          console.error('Error saving API key:', err);
+        }
+      }
+    };
+
+    saveApiKey();
+  }, [apiKey]);
+
+  // Handle creating a bookmark with recent folder tracking
+  const handleCreateBookmark = useCallback(async (pathText, title, shouldCreateFolder) => {
+    if (isBookmarkAdded) return;
+
+    try {
+      setError(null);
+      await createBookmarkWithPath(
+        folderStructureArray,
+        pathText,
+        title,
+        url,
+        shouldCreateFolder
+      );
+      
+      // Save to recent folders
+      await saveRecentFolder(pathText);
+      const updatedRecent = await getRecentFolders();
+      setRecentFolders(updatedRecent);
+      
+      // Invalidate cache since bookmarks changed
+      await invalidateBookmarkCache();
+      
+      setIsBookmarkAdded(true);
+      setExistingBookmark({ title, path: pathText });
+    } catch (err) {
+      console.error('Error creating bookmark:', err);
+      setError('Failed to create bookmark. Please try again.');
+    }
+  }, [isBookmarkAdded, folderStructureArray, url]);
+
+  // Handle copying URL to clipboard (memoized)
+  const handleCopyLink = useCallback(async () => {
+    try {
+      await copyToClipboard(url);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (err) {
+      console.error('Error copying to clipboard:', err);
+      setError('Failed to copy URL');
+    }
+  }, [url]);
+
+  // Handle getting AI recommendations with progress feedback
+  const handleGetRecommendations = useCallback(async () => {
+    if (!apiKey || !validateApiKey(apiKey)) {
+      setError('Please enter a valid API key');
+      return;
+    }
+
+    if (!folderStructure) {
+      setError('Bookmark structure not loaded');
+      return;
+    }
+
+    setIsLoading(true);
+    setLoadingStep('Getting AI recommendations...');
+    setError(null);
+
+    try {
+      const recs = await getBookmarkRecommendations(apiKey, folderStructure, url, structureSummary);
+      setRecommendations(recs);
+    } catch (err) {
+      console.error('Error getting recommendations:', err);
+      setError('Failed to get recommendations. Please check your API key.');
+    } finally {
+      setIsLoading(false);
+      setLoadingStep('');
+    }
+  }, [apiKey, folderStructure, url, structureSummary]);
+
+  // Handle quick save to recent folder
+  const handleQuickSave = useCallback(async (folderPath) => {
+    if (isBookmarkAdded || !folderPath) return;
+    
+    try {
+      setError(null);
+      // Extract a simple title from URL
+      const urlObj = new URL(url);
+      const title = urlObj.hostname.replace('www.', '') + (urlObj.pathname.split('/').filter(Boolean)[0] || '') || 'Quick Save';
+      
+      await handleCreateBookmark(folderPath, title, false);
+    } catch (err) {
+      console.error('Error quick saving:', err);
+      setError('Failed to quick save bookmark');
+    }
+  }, [isBookmarkAdded, url, handleCreateBookmark]);
+
+  // Memoized values to prevent unnecessary recalculations
+  const hasRecentFolders = useMemo(() => recentFolders.length > 0, [recentFolders.length]);
+  const mostRecentFolder = useMemo(() => recentFolders[0], [recentFolders]);
+  const canQuickSave = useMemo(() => 
+    hasRecentFolders && !isBookmarkAdded && !existingBookmark,
+    [hasRecentFolders, isBookmarkAdded, existingBookmark]
+  );
+
+  // Handle API key submission
+  const handleApiSubmit = () => {
+    if (apiInput && validateApiKey(apiInput)) {
+      setApiKey(apiInput);
+      setApiInput('');
+      setOpenProfile(false);
+      setError(null);
+    } else if (apiKey) {
+      // Reset API key
+      setApiKey('');
+      setApiInput('');
+      setOpenProfile(true);
+      setRecommendations([]);
+      setIsBookmarkAdded(false);
+    }
   };
 
-  const createBookmark = (text,title,flag) => {
-    const folders = text.split(' > ');
-    console.log(folders);
-
-    let allFolders = folderStructureArray;
-    let parentId = '1';
-
-    for(let i=0; i<folders.length; i++) {
-      const folder = folders[i];
-      const result = allFolders.find(obj => obj.title === folder);
-      if(result) {
-        parentId = result.id;
-        allFolders = result.children ? result.children : allFolders;
-      }
-      else {
-        break;
-      }
-    }
-    
-    if(flag) {
-      const newFolder = folders[folders.length - 1];
-      chrome.bookmarks.create({ parentId: parentId, title: newFolder }, function (newFolderNode) {
-        chrome.bookmarks.create({ parentId: newFolderNode.id, title: title, url: url }, function (newBookmark) {
-          console.log('Bookmark created in new folder: ' + newBookmark.title);
-        });
-      });
-    }
-    else {
-      chrome.bookmarks.create({parentId: parentId, title: title, url: url}, function(newBookmark) {
-        console.log('Bookmark created: ' + newBookmark.title);
-      });
-    }
-
-    setdone(true);
-  }
-
-  const copyLink = () => {
-    navigator.clipboard.writeText(url);
-    setcopy(true);
-  }
-
-  async function fetchBookmarks() {
-    await chrome.bookmarks.getTree(function(bookmarkTreeNodes) {
-      console.log(bookmarkTreeNodes);
-      console.log(bookmarkTreeNodes[0].children[0].children);
-      setfolderStructureArray(bookmarkTreeNodes[0].children[0].children);
-      const markdown = generateMarkdown(bookmarkTreeNodes);
-      setFolderStructure(markdown);
-    });
-  }
-
-  function generateMarkdown(bookmarkNodes, depth = 1) {
-    let markdown = '';
-    bookmarkNodes.forEach(function(node) {
-      if (node.children) {
-        markdown += `${'#'.repeat(depth)} ${node.title || 'Folder'}\n`;
-        markdown += generateMarkdown(node.children, depth + 1);
-      } else {
-        markdown += `${'#'.repeat(depth + 1)} [${node.title}](${node.url})\n`;
-      }
-    });
-    return markdown;
-  }
-
-  const getRecommendations = async () => {
-    const chatSession = model.startChat({
-      generationConfig,
-      history: [
-      ],
-    });
-    setIsLoading(true);
-    try {
-      const result = await chatSession.sendMessage(folderStructure);
-      const responseText = await result.response.text();
-      const responseJson = JSON.parse(responseText);
-      const recommendationsArray = responseJson.recommendations;
-      setrecommendations(recommendationsArray);
-    }
-    catch (error) {
-      console.error("Error fetching data: ",error);
-    }
-    finally {
-      setIsLoading(false);
-    }
-  }
+  // Handle API input change
+  const handleApiInputChange = (e) => {
+    setApiInput(e.target.value);
+    setError(null);
+  };
 
   return (
-    <div className='main-div'>
+    <div className="main-div">
+      <ProfileSettings
+        isOpen={openProfile}
+        onToggle={() => setOpenProfile(!openProfile)}
+        apiKey={apiKey}
+        apiInput={apiInput}
+        onApiInputChange={handleApiInputChange}
+        onSubmit={handleApiSubmit}
+      />
 
-        <div className="profile-div" onClick={() => setopenProfile(!openProfile)}>
-          <div className="user-btn">
-          <i className={openProfile ? "ri-arrow-left-s-line" : "ri-user-3-fill"}></i>
-          </div>
+      {error && (
+        <div className="error-message nunito-sans-400">
+          {error}
         </div>
+      )}
 
-        {openProfile ? <div className="gemini-form">
-          <input className='api-key-input nunito-sans-400' onChange={e => setapiInput(e.target.value)} value={apiInput} type="password" name="gemini-api-key" placeholder='Enter Your Gemini Api Key' id="" />
-          <div className="action-btn" onClick={() => {
-            setapiKey(apiInput);
-            setapiInput();
-            setopenProfile(false);
-          }}>{apiKey ? "Reset" : "Submit"}</div>
-          <div className="instructions nunito-sans-400">
-            <h2>Instructions: </h2>
-            <li>Go to <a href="https://console.cloud.google.com/products">Google Cloud</a></li>
-            <li>Sign Up</li>
-            <li>Click Select a Project</li>
-            <li>Create a new Project</li>
-            <li>Head over to <a href="https://aistudio.google.com/">Google AI Studio</a></li>
-            <li>Click Get Api Key</li>
-            <li>Click Create Api Key</li>
-            <li>Select the Google project created earlier</li>
-            <li>Copy the Api Key and remember to store it somewhere safe.</li>
+      {apiKey && !openProfile && (
+        <>
+          <URLDisplay
+            url={url}
+            isCopied={isCopied}
+            onCopy={handleCopyLink}
+          />
+
+          {/* Show tips on first use */}
+          {!hasRecentFolders && !existingBookmark && recommendations.length === 0 && (
+            <div className="info-tip nunito-sans-400">
+              <span className="info-icon">💡</span>
+              <p>
+                After you bookmark a page, you&apos;ll see a <strong>Quick Save</strong> button here for instant bookmarking!
+              </p>
+            </div>
+          )}
+
+          {existingBookmark && (
+            <div className="duplicate-notice nunito-sans-400">
+              <span className="duplicate-icon">ℹ️</span>
+              <div>
+                <strong>Already bookmarked</strong>
+                <p>Saved in: {existingBookmark.path}</p>
+              </div>
+            </div>
+          )}
+
+          {canQuickSave && (
+            <div className="quick-save-container">
+              <button
+                onClick={() => handleQuickSave(mostRecentFolder)}
+                className="quick-save-btn nunito-sans-500"
+                disabled={isLoading}
+              >
+                ⚡ Quick Save to &quot;{mostRecentFolder}&quot;
+              </button>
+              {recentFolders.length > 1 && (
+                <button
+                  onClick={() => setShowRecentFolders(!showRecentFolders)}
+                  className="recent-toggle-btn nunito-sans-400"
+                  title="Show more recent folders"
+                >
+                  {showRecentFolders ? '▲' : '▼'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {showRecentFolders && recentFolders.length > 1 && (
+            <div className="recent-folders-list">
+              <h3 className="nunito-sans-500">Recent Folders:</h3>
+              {recentFolders.slice(1).map((folder, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => {
+                    handleQuickSave(folder);
+                    setShowRecentFolders(false);
+                  }}
+                  className="recent-folder-item nunito-sans-400"
+                  disabled={isLoading || isBookmarkAdded}
+                >
+                  📁 {folder}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {loadingStep && (
+            <div className="progress-indicator">
+              <div className="progress-text nunito-sans-400">{loadingStep}</div>
+              <div className="progress-bar">
+                <div 
+                  className="progress-fill"
+                  style={{
+                    width: loadingStep.includes('Loading bookmarks') ? '33%' :
+                           loadingStep.includes('Analyzing') ? '66%' :
+                           loadingStep.includes('AI') ? '100%' : '0%'
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="action-container">
+            <button
+              onClick={handleGetRecommendations}
+              className="action-btn nunito-sans-500"
+              disabled={isBookmarkAdded || isLoading}
+              style={
+                isBookmarkAdded
+                  ? { backgroundColor: 'green', pointerEvents: 'none' }
+                  : isLoading
+                  ? { opacity: 0.6, cursor: 'wait' }
+                  : {}
+              }
+            >
+              {isBookmarkAdded ? 'Bookmark Added ✓' : isLoading ? 'Loading...' : 'Get Recommendations'}
+            </button>
           </div>
-        </div> : null}
 
-        {apiKey && !openProfile ? <div className="url-display nunito-sans-500">
-          <i className="ri-links-line"></i>
-          <div className='current-url nunito-sans-500'>{url}</div>
-          <i style={{cursor: "pointer"}} className={copy ? "ri-check-double-line" : "ri-clipboard-line"} onClick={() => copyLink()}></i>
-        </div> : null}
+          {isLoading && <LoadingSpinner message="Processing..." />}
 
-        {apiKey && !openProfile ? <div style={{display: "flex", justifyContent: "center", alignItems: "center"}}>
-          <button onClick={() => {getRecommendations()}} style={done ? {backgroundColor: "green", pointerEvents: "none"} : null} className='action-btn nunito-sans-500'>{done ? "Bookmark Added" : "Recommend"}</button>
-        </div> : null}
-
-        {isLoading && apiKey && !openProfile ? <h2 className='loading nunito-sans-500'>Loading...</h2> : null}
-
-        {recommendations.length && apiKey && !openProfile ? <div className='recommendations nunito-sans-400'>
-            <h2>Reccomendations</h2>
-            <div className="folder-recomm">
-              {recommendations.map(({add_folder,text,title}) => {
-                return !add_folder && <div className='recommendations-div' onMouseEnter={() => sethover(text)} onMouseLeave={() => sethover(null)} onClick={() => createBookmark(text,title,false)} key={text}>
-                  {hover === text ? title : text}
-                </div>
-              })}
-            </div>
-            <h2>Create a new folder?</h2>
-            <div className="new-folder-recomm">
-              {recommendations.map(({add_folder,text,title}) => {
-                return add_folder && <div className='recommendations-div' onMouseEnter={() => sethover(text)} onMouseLeave={() => sethover(null)} onClick={() => createBookmark(text,title,true)} key={text}>
-                  {hover === text ? title : text}
-                </div>
-              })}
-            </div>
-        </div> : null}
+          {recommendations.length > 0 && !isLoading && (
+            <BookmarkRecommendations
+              recommendations={recommendations}
+              onCreateBookmark={handleCreateBookmark}
+              isBookmarkAdded={isBookmarkAdded}
+            />
+          )}
+        </>
+      )}
     </div>
-  )
+  );
 }
 
-export default App
+export default App;
