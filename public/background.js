@@ -1,67 +1,26 @@
-/**
- * Background script for Bookmark AI Assistant
- * Handles background operations and message passing
- */
-
-// Listen for extension installation or update
 chrome.runtime.onInstalled.addListener((details) => {
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
   if (details.reason === 'install') {
-    console.log('Bookmark AI Assistant installed');
-  } else if (details.reason === 'update') {
-    console.log('Bookmark AI Assistant updated');
+    chrome.runtime.openOptionsPage();
   }
 });
 
-// Listen for messages from the popup or content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log('Message received:', request);
-  
-  // Handle different message types
-  if (request.action === 'getBookmarks') {
-    chrome.bookmarks.getTree((bookmarkTreeNodes) => {
-      sendResponse({ bookmarks: bookmarkTreeNodes });
-    });
-    return true; // Keep the message channel open for async response
-  }
-  
-  if (request.action === 'createBookmark') {
-    const { parentId, title, url } = request;
-    chrome.bookmarks.create({ parentId, title, url }, (newBookmark) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({ 
-          success: false, 
-          error: chrome.runtime.lastError.message 
-        });
-      } else {
-        sendResponse({ 
-          success: true, 
-          bookmark: newBookmark 
-        });
+  if (request.action === 'openSidePanel') {
+    const open = async () => {
+      const windowId = sender.tab?.windowId;
+      if (windowId) {
+        await chrome.sidePanel.open({ windowId });
+        sendResponse({ ok: true });
+        return;
       }
-    });
-    return true;
-  }
-  
-  if (request.action === 'createFolder') {
-    const { parentId, title } = request;
-    chrome.bookmarks.create({ parentId, title }, (newFolder) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({ 
-          success: false, 
-          error: chrome.runtime.lastError.message 
-        });
-      } else {
-        sendResponse({ 
-          success: true, 
-          folder: newFolder 
-        });
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.windowId) {
+        await chrome.sidePanel.open({ windowId: tab.windowId });
       }
-    });
+      sendResponse({ ok: true });
+    };
+    open().catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
 });
-
-// Log when the extension is loaded
-console.log('Bookmark AI Assistant background script loaded');
-
-  

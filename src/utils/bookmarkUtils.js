@@ -251,6 +251,35 @@ export const createFolder = (parentId, folderName) => {
   });
 };
 
+const BOOKMARKS_BAR_ID = '1';
+
+/**
+ * Walks as far down the path as folders already exist, so only the genuinely
+ * missing tail has to be created.
+ * @param {Array} folderArray - Flat folder list from flattenFolders
+ * @param {Array} parts - Path segments
+ * @returns {Object} The deepest existing folder id and the unmatched remainder
+ */
+const resolveExistingPrefix = (folderArray, parts) => {
+  // The first segment can sit under any root (Bookmarks bar, Other bookmarks),
+  // so it is matched by title across the whole tree.
+  const first = folderArray.find(node => node.title === parts[0]);
+  if (!first) return { parentId: BOOKMARKS_BAR_ID, rest: parts };
+
+  let parentId = first.id;
+  let index = 1;
+  while (index < parts.length) {
+    const next = folderArray.find(
+      node => String(node.parentId) === String(parentId) && node.title === parts[index]
+    );
+    if (!next) break;
+    parentId = next.id;
+    index += 1;
+  }
+
+  return { parentId, rest: parts.slice(index) };
+};
+
 /**
  * Creates a bookmark with a new folder if needed
  * @param {Array} folderStructureArray - The current folder structure
@@ -267,19 +296,27 @@ export const createBookmarkWithPath = async (
   url,
   shouldCreateFolder = false
 ) => {
-  const folders = pathString.split(' > ').map(f => f.trim());
-  const { parentId } = findFolderByPath(folderStructureArray, folders);
-  
+  const folders = pathString.split(' > ').map(f => f.trim()).filter(Boolean);
+
   try {
     if (shouldCreateFolder) {
-      // Create a new folder and then create the bookmark inside it
-      const newFolderName = folders[folders.length - 1];
-      const newFolder = await createFolder(parentId, newFolderName);
-      return await createBookmark(newFolder.id, title, url);
-    } else {
-      // Create bookmark directly in the found folder
+      // Every missing segment has to be created, not just the leaf, or a
+      // suggestion like "Development > AI > Agents" lands in "Development".
+      const { parentId: prefixId, rest } = resolveExistingPrefix(folderStructureArray, folders);
+      if (!rest.length) {
+        return await createBookmark(prefixId, title, url);
+      }
+      const { parentId } = await ensureFolderPath(
+        folderStructureArray,
+        rest.join(' > '),
+        prefixId
+      );
       return await createBookmark(parentId, title, url);
     }
+
+    // Create bookmark directly in the found folder
+    const { parentId } = findFolderByPath(folderStructureArray, folders);
+    return await createBookmark(parentId, title, url);
   } catch (error) {
     console.error('Error creating bookmark:', error);
     throw error;
@@ -483,37 +520,111 @@ export const checkBookmarkExists = (url, bookmarkNodes) => {
   return found;
 };
 
-/**
- * Gets recently used bookmark folders from storage
- * @returns {Promise<Array>} Array of recent folder paths
- */
-export const getRecentFolders = async () => {
-  try {
-    const result = await chrome.storage.local.get('recentFolders');
-    return result.recentFolders || [];
-  } catch (error) {
-    console.error('Error getting recent folders:', error);
-    return [];
-  }
+const RESERVED_TITLES = new Set(['Bookmarks bar', 'Other bookmarks', 'Mobile bookmarks', 'Bookmarks Bar']);
+
+export const flattenBookmarkNodes = (nodes, path = [], parentId = null) => {
+  const items = [];
+  (nodes || []).forEach((node) => {
+    const nextPath = node.title && !RESERVED_TITLES.has(node.title)
+      ? [...path, node.title]
+      : path;
+    if (node.children) {
+      items.push(...flattenBookmarkNodes(node.children, nextPath, node.id));
+    } else if (node.url) {
+      items.push({
+        id: node.id,
+        title: node.title,
+        url: node.url,
+        parentId: node.parentId || parentId,
+        index: node.index,
+        path: path.join(' > ') || 'Root',
+      });
+    }
+  });
+  return items;
 };
 
-/**
- * Saves a folder to recent folders list
- * @param {string} folderPath - The folder path to save
- * @returns {Promise<void>}
- */
-export const saveRecentFolder = async (folderPath) => {
-  try {
-    const recent = await getRecentFolders();
-    
-    // Remove if already exists (to move to front)
-    const filtered = recent.filter(path => path !== folderPath);
-    
-    // Add to front and keep only last 5
-    const updated = [folderPath, ...filtered].slice(0, 5);
-    
-    await chrome.storage.local.set({ recentFolders: updated });
-  } catch (error) {
-    console.error('Error saving recent folder:', error);
+export const flattenFolders = (nodes) => {
+  const result = [];
+  const walk = (list) => {
+    (list || []).forEach((node) => {
+      if (node.children) {
+        result.push({ id: node.id, title: node.title, children: node.children, parentId: node.parentId });
+        walk(node.children);
+      }
+    });
+  };
+  walk(nodes);
+  return result;
+};
+
+export const buildDomainFolderMap = (bookmarks) => {
+  const counts = {};
+  bookmarks.forEach((bookmark) => {
+    try {
+      const domain = new URL(bookmark.url).hostname.replace(/^www\./, '');
+      if (!counts[domain]) counts[domain] = {};
+      const folder = bookmark.path || 'Root';
+      counts[domain][folder] = (counts[domain][folder] || 0) + 1;
+    } catch {
+      /* skip */
+    }
+  });
+  const map = {};
+  Object.entries(counts).forEach(([domain, folders]) => {
+    map[domain] = Object.entries(folders).sort((a, b) => b[1] - a[1])[0][0];
+  });
+  return map;
+};
+
+export const moveBookmark = (id, parentId, index) =>
+  new Promise((resolve, reject) => {
+    const destination = { parentId };
+    if (typeof index === 'number') destination.index = index;
+    chrome.bookmarks.move(id, destination, (node) => {
+      if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+      else resolve(node);
+    });
+  });
+
+export const getBookmarkNode = (id) =>
+  new Promise((resolve, reject) => {
+    chrome.bookmarks.get(id, (nodes) => {
+      if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+      else resolve(nodes?.[0] || null);
+    });
+  });
+
+export const removeBookmarkNode = (id) =>
+  new Promise((resolve, reject) => {
+    chrome.bookmarks.remove(id, () => {
+      if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+      else resolve();
+    });
+  });
+
+export const findFolderIdByPath = (folderArray, pathString) => {
+  const folders = pathString.split(' > ').map((part) => part.trim()).filter(Boolean);
+  const { parentId } = findFolderByPath(folderArray, folders);
+  return parentId;
+};
+
+export const ensureFolderPath = async (folderArray, pathString, rootId = '2') => {
+  const parts = pathString.split(' > ').map((part) => part.trim()).filter(Boolean);
+  let parentId = rootId;
+  let current = folderArray.filter((node) => String(node.parentId) === String(rootId));
+  const created = [];
+
+  for (const name of parts) {
+    let existing = current.find((node) => node.title === name);
+    if (!existing) {
+      existing = await createFolder(parentId, name);
+      created.push(existing);
+      folderArray.push({ id: existing.id, title: existing.title, children: [], parentId: existing.parentId });
+    }
+    parentId = existing.id;
+    current = folderArray.filter((node) => String(node.parentId) === String(parentId));
   }
+
+  return { parentId, created };
 };

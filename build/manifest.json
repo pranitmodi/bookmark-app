@@ -1,20 +1,39 @@
 {
   "manifest_version": 3,
   "name": "Bookmark AI Assistant",
-  "version": "2.0.0",
-  "description": "An AI-powered Chrome extension that intelligently organizes your bookmarks based on your existing folder structure.",
+  "version": "3.1.0",
+  "description": "Organize your bookmark library with local or BYO AI, then save new pages to the right folder in one click.",
   "action": {
     "default_popup": "index.html",
     "default_title": "Bookmark AI Assistant"
   },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": [
     "bookmarks",
     "tabs",
-    "activeTab",
-    "storage"
+    "storage",
+    "sidePanel",
+    "unlimitedStorage"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.openai.com/*",
+    "https://api.anthropic.com/*",
+    "http://127.0.0.1:11434/*",
+    "http://localhost:11434/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ],
   "icons": {
     "16": "icon16.png",

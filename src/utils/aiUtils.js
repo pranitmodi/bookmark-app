@@ -1,218 +1,305 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { completeJson } from '../ai/router.js';
+import { renderSections } from '../ai/budget.js';
+import { RECOMMEND_SYSTEM } from '../ai/prompts.js';
+import { loadOrganizationProfile, loadPlacementHistory } from '../ai/storage.js';
+import { hostnameOf } from './clusterBookmarks.js';
 
-/**
- * Configuration for the AI model
- * Using gemini-2.5-flash (stable, best price-performance model)
- * Reference: https://ai.google.dev/gemini-api/docs/models/gemini
- */
-const MODEL_NAME = "gemini-2.5-flash";
+const recommendSchema = {
+  type: 'object',
+  properties: {
+    recommendations: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          add_folder: { type: 'boolean' },
+          text: { type: 'string' },
+          title: { type: 'string' },
+        },
+        required: ['add_folder', 'text', 'title'],
+      },
+    },
+  },
+  required: ['recommendations'],
+};
 
-const SYSTEM_INSTRUCTION = `You are an intelligent bookmark organization assistant. Your task is to recommend the best folder location for a new bookmark based on the user's existing bookmark organization patterns.
+const MIN_EXISTING_RECS = 3;
+const MAX_EXISTING_RECS = 4;
+const NEW_FOLDER_RECS = 2;
 
-You will receive:
-1. The URL to be bookmarked
-2. The user's complete bookmark folder structure (with nested folders)
-3. Examples of existing bookmarks in each folder (to understand their organization pattern)
+// Labels that carry no meaning on their own, so "bbc.co.uk" still yields "Bbc".
+const GENERIC_DOMAIN_LABELS = new Set(['co', 'com', 'org', 'net', 'ac', 'gov', 'edu']);
 
-Your Analysis Process:
-1. **Extract URL Information**: Analyze the domain, path, and content type from the URL
-   - Identify the website category (e.g., documentation, shopping, news, social media)
-   - Recognize technology/topic (e.g., React, Python, Machine Learning)
-   - Understand the content type (e.g., tutorial, reference, article, tool)
+const TITLE_STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'for', 'with', 'how', 'what', 'why', 'your', 'you',
+  'to', 'of', 'in', 'on', 'is', 'are', 'best', 'guide', 'tutorial', 'docs',
+  'documentation', 'home', 'welcome', 'official', 'new', 'get', 'using',
+]);
 
-2. **Pattern Recognition**: Study the user's existing bookmarks to identify their organization patterns:
-   - How do they categorize similar websites?
-   - What naming conventions do they use for folders?
-   - How deep is their folder nesting?
-   - What types of sites are grouped together?
+const titleCase = (value) => value
+  .split(/[\s\-_]+/)
+  .filter(Boolean)
+  .map((word) => word[0].toUpperCase() + word.slice(1).toLowerCase())
+  .join(' ');
 
-3. **Match with Existing Folders**: Find the best matching folders by:
-   - Looking for folders with similar domain bookmarks
-   - Identifying topic/category matches
-   - Considering the folder's existing bookmark patterns
-   - Checking nested subfolder relevance
+/** "docs.python.org" -> "Python", "bbc.co.uk" -> "Bbc" */
+const folderNameFromDomain = (domain) => {
+  if (!domain) return '';
+  const labels = domain.split('.').filter(Boolean);
+  if (labels.length > 1) labels.pop();
+  while (labels.length > 1 && GENERIC_DOMAIN_LABELS.has(labels[labels.length - 1])) {
+    labels.pop();
+  }
+  return titleCase(labels[labels.length - 1] || domain);
+};
 
-4. **Provide Recommendations**:
-   - Maximum 5 recommendations for EXISTING folders (prioritize these)
-   - Maximum 2 recommendations for NEW folders (only if no good existing match)
-   - Each recommendation must include:
-     * Full path with proper nesting: "Parent > Child > Grandchild"
-     * A descriptive, concise bookmark title (NOT just the URL or domain)
-     * Whether it requires creating a new folder
+const folderNameFromTitle = (title) => {
+  const words = [];
+  (title || '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+    .split(/\s+/)
+    .forEach((word) => {
+      const lower = word.toLowerCase();
+      // Titles repeat the product name ("Python Tutorial - Python docs"), which
+      // would otherwise produce a folder called "Python Python".
+      if (word.length <= 2 || TITLE_STOPWORDS.has(lower)) return;
+      if (words.some((seen) => seen.toLowerCase() === lower)) return;
+      words.push(word);
+    });
+  if (!words.length) return '';
+  return titleCase(words.slice(0, 2).join(' '));
+};
 
-5. **Title Generation Guidelines**:
-   - Be specific and descriptive
-   - Include the main topic/technology
-   - Keep it concise (under 60 characters)
-   - Make it searchable and meaningful
-   - Examples: "React Hooks Tutorial", "Python Data Science Guide", "AWS Lambda Documentation"
-
-Important Rules:
-- ALWAYS prioritize existing folders over creating new ones
-- Look for nested subfolders that match the URL topic
-- Use the EXACT folder names from the provided structure
-- Ensure the full path is accurate with proper " > " separators
-- Generate different titles for each recommendation
-- Consider both broad categories and specific subcategories
-
-CRITICAL: You MUST respond with ONLY valid JSON in this exact format, no additional text:
-{
-  "recommendations": [
-    {
-      "add_folder": boolean,
-      "text": "Full > Folder > Path",
-      "title": "Bookmark Title"
+/** Words worth matching against folder names, taken from the domain and title. */
+const relevanceKeywords = (url, title) => {
+  const words = new Set();
+  const labels = hostnameOf(url).split('.').filter(Boolean);
+  // The TLD is never a topic: ".dev" would otherwise match every "Development".
+  if (labels.length > 1) labels.pop();
+  labels.forEach((label) => {
+    const lower = label.toLowerCase();
+    if (lower.length > 2 && !GENERIC_DOMAIN_LABELS.has(lower) && !TITLE_STOPWORDS.has(lower)) {
+      words.add(lower);
     }
-  ]
-}
-
-Each recommendation must have all three fields: add_folder (boolean), text (string with folder path), and title (string).`;
-
-const generationConfig = {
-  temperature: 1,
-  topP: 0.95,
-  topK: 40,
-  maxOutputTokens: 8192,
+  });
+  (title || '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+    .split(/[\s-]+/)
+    .forEach((word) => {
+      const lower = word.toLowerCase();
+      if (lower.length > 2 && !TITLE_STOPWORDS.has(lower)) words.add(lower);
+    });
+  return [...words];
 };
 
 /**
- * Gets AI-powered bookmark recommendations
- * @param {string} apiKey - The Gemini API key
- * @param {string} folderStructure - The bookmark folder structure in markdown
- * @param {string} url - The URL to bookmark
- * @param {string} structureSummary - Optional summary of bookmark patterns
- * @returns {Promise<Array>} Array of recommendation objects
+ * Existing folders whose names overlap this page's domain or title, best first.
+ * Folder names are the only per-page signal the library offers beyond an exact
+ * domain match, so they stand in for the old "recently used" list, which said
+ * nothing about the page being saved.
  */
-export const getBookmarkRecommendations = async (apiKey, folderStructure, url, structureSummary = '') => {
-  if (!apiKey) {
-    throw new Error('API key is required');
-  }
+const relevantFolderPaths = ({ url, title, folderPaths }) => {
+  const keywords = relevanceKeywords(url, title);
+  if (!keywords.length) return [];
 
-  // Trim the API key to remove any accidental spaces
-  const trimmedApiKey = apiKey.trim();
-
-  if (!folderStructure) {
-    throw new Error('Folder structure is required');
-  }
-
-  if (!url) {
-    throw new Error('URL is required');
-  }
-
-  try {
-    const genAI = new GoogleGenerativeAI(trimmedApiKey);
-    
-    const model = genAI.getGenerativeModel({
-      model: MODEL_NAME,
-      systemInstruction: SYSTEM_INSTRUCTION,
-    });
-
-    const chatSession = model.startChat({
-      generationConfig,
-      history: [],
-    });
-
-    // Construct an enhanced prompt with URL, pattern analysis, and folder structure
-    const prompt = `Please analyze this URL and recommend the best bookmark folder locations based on the user's organization patterns.
-
-**URL to Bookmark:**
-${url}
-
-${structureSummary}
-**User's Bookmark Folder Structure:**
-(Format: Folder names with example bookmarks showing what content belongs in each folder)
-
-${folderStructure}
-
-**Instructions:**
-- Carefully analyze the URL's domain, path, and likely content type
-- Study the existing bookmarks in each folder to understand the user's categorization pattern
-- Look for folders that contain similar websites or related topics
-- Prioritize EXISTING folders with matching patterns
-- Consider nested subfolders that might be more specific
-- Only suggest new folders if there's truly no good existing match
-- Provide accurate folder paths with exact names from the structure above
-
-IMPORTANT: Respond with ONLY a JSON object, no markdown, no explanation. Use this exact format:
-{
-  "recommendations": [
-    {"add_folder": false, "text": "Folder Path", "title": "Bookmark Title"}
-  ]
-}`;
-    
-    const result = await chatSession.sendMessage(prompt);
-    let responseText = result.response.text().trim();
-    
-    // Remove markdown code blocks if present
-    if (responseText.startsWith('```json')) {
-      responseText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-    } else if (responseText.startsWith('```')) {
-      responseText = responseText.replace(/```\n?/g, '');
-    }
-    
-    responseText = responseText.trim();
-    
-    // Parse the JSON response
-    let responseJson;
-    try {
-      responseJson = JSON.parse(responseText);
-    } catch {
-      console.error('Failed to parse AI response:', responseText);
-      throw new Error('AI returned invalid JSON format');
-    }
-    
-    // Validate the response structure
-    if (!responseJson.recommendations || !Array.isArray(responseJson.recommendations)) {
-      console.error('Invalid response structure:', responseJson);
-      throw new Error('Invalid response format from AI');
-    }
-
-    // Validate each recommendation has required fields
-    const validRecommendations = responseJson.recommendations.filter(rec => 
-      typeof rec.add_folder === 'boolean' && 
-      typeof rec.text === 'string' && 
-      typeof rec.title === 'string'
-    );
-
-    if (validRecommendations.length === 0) {
-      throw new Error('No valid recommendations received from AI');
-    }
-
-    return validRecommendations;
-  } catch (error) {
-    console.error('Error getting AI recommendations:', error);
-    console.error('Error details:', {
-      message: error.message,
-      status: error.status,
-      statusText: error.statusText,
-      name: error.name,
-      stack: error.stack
-    });
-    
-    // Provide more specific error messages
-    if (error.message.includes('API_KEY_INVALID') || error.message.includes('API key not valid')) {
-      throw new Error('Invalid API key. Please check your Gemini API key is correct.');
-    } else if (error.status === 400) {
-      throw new Error('Bad request to Gemini API. The model might not be available.');
-    } else if (error.status === 403) {
-      throw new Error('API key forbidden. Please check your API key permissions.');
-    } else if (error.status === 429 || error.message.includes('quota')) {
-      throw new Error('API quota exceeded. Please check your Gemini account.');
-    } else if (error.status === 404) {
-      throw new Error('Model not found. Please try again or check model availability.');
-    } else if (error.message.includes('network') || error.message.includes('fetch') || !navigator.onLine) {
-      throw new Error('Network error. Please check your internet connection.');
-    } else {
-      throw new Error(`Failed to get recommendations: ${error.message}`);
-    }
-  }
+  return (folderPaths || [])
+    .map((path) => {
+      const segments = path.toLowerCase().split(' > ');
+      const leaf = segments.at(-1);
+      const words = segments.flatMap((segment) => segment.split(/\s+/)).filter(Boolean);
+      let score = 0;
+      keywords.forEach((keyword) => {
+        if (leaf === keyword) score += 4;
+        else if (words.includes(keyword)) score += 3;
+        else if (words.some((word) => (
+          word.length > 3 && (word.includes(keyword) || keyword.includes(word))
+        ))) score += 1;
+      });
+      if (!score) return null;
+      // A matching subfolder is usually a better home than its parent.
+      return { path, score: score + Math.min(2, segments.length - 1) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+    .slice(0, 6)
+    .map((item) => item.path);
 };
 
 /**
- * Validates if an API key is properly formatted
- * @param {string} apiKey - The API key to validate
- * @returns {boolean} Whether the API key appears valid
+ * Folder paths this bookmark could plausibly live under, best first: where this
+ * domain already lives, then folders whose names match the page, then those
+ * folders' parents. Deliberately returns nothing when the library holds no
+ * folder related to this page, rather than padding with unrelated favourites.
  */
-export const validateApiKey = (apiKey) => {
-  return apiKey && typeof apiKey === 'string' && apiKey.trim().length > 0;
+const parentCandidates = ({ domain, url, title, domainMap, folderPaths }) => {
+  const seen = new Set();
+  const paths = [];
+  const push = (path) => {
+    if (!path || path === 'Root') return;
+    const key = path.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    paths.push(path);
+  };
+
+  const matches = relevantFolderPaths({ url, title, folderPaths });
+  push(domainMap?.[domain]);
+  matches.forEach(push);
+
+  // An ancestor of a matching folder is still about the right topic, so it is
+  // the last acceptable candidate. Unrelated favourites are not offered at all.
+  [domainMap?.[domain], ...matches].filter(Boolean).forEach((path) => {
+    const parts = path.split(' > ');
+    for (let depth = parts.length - 1; depth > 0; depth -= 1) {
+      push(parts.slice(0, depth).join(' > '));
+    }
+  });
+
+  return paths;
+};
+
+/**
+ * New-folder paths in preference order, each nested under an existing folder
+ * when the library has one to nest under. The caller takes the first few that
+ * are not already on the list, so this returns more than it needs.
+ */
+const newFolderCandidates = ({ url, title, domainMap, folderPaths }) => {
+  const domain = hostnameOf(url);
+  const domainName = folderNameFromDomain(domain);
+  const names = [...new Set(
+    [domainName, folderNameFromTitle(title), domainName && `${domainName} Resources`].filter(Boolean),
+  )].slice(0, 3);
+
+  // A new folder reads better one level down than buried, so each candidate
+  // path contributes its top-level segment as a parent.
+  const parents = [...new Set(
+    parentCandidates({ domain, url, title, domainMap, folderPaths })
+      .map((path) => path.split(' > ')[0]),
+  )].slice(0, 3);
+
+  if (!parents.length) return names;
+
+  // Parent-major order: two different ideas under the best parent beat the same
+  // name offered under two unrelated parents.
+  const paths = [];
+  parents.forEach((parent) => {
+    names.forEach((name) => {
+      // Skip "Development > Python > Python" style stutter.
+      if (parent.toLowerCase().split(' > ').includes(name.toLowerCase())) return;
+      paths.push(`${parent} > ${name}`);
+    });
+  });
+  return paths;
+};
+
+/**
+ * The model routinely returns fewer options than asked for, so top the list up
+ * locally to at least MIN_EXISTING_RECS existing folders plus NEW_FOLDER_RECS
+ * new-folder ideas.
+ */
+export const ensureRecommendationMix = (recs, { url, title, domainMap, folderPaths }) => {
+  const domain = hostnameOf(url);
+  const fallbackTitle = title || domain || 'Bookmark';
+  const taken = new Set(recs.map((rec) => rec.text.toLowerCase()));
+  const existing = recs.filter((rec) => !rec.add_folder);
+  const created = recs.filter((rec) => rec.add_folder);
+
+  parentCandidates({ domain, url, title, domainMap, folderPaths }).forEach((path) => {
+    if (existing.length >= MIN_EXISTING_RECS || taken.has(path.toLowerCase())) return;
+    taken.add(path.toLowerCase());
+    existing.push({ add_folder: false, text: path, title: fallbackTitle, source: 'fallback' });
+  });
+
+  newFolderCandidates({ url, title, domainMap, folderPaths }).forEach((path) => {
+    if (created.length >= NEW_FOLDER_RECS || taken.has(path.toLowerCase())) return;
+    taken.add(path.toLowerCase());
+    created.push({ add_folder: true, text: path, title: fallbackTitle, source: 'fallback' });
+  });
+
+  return [...existing.slice(0, MAX_EXISTING_RECS), ...created.slice(0, NEW_FOLDER_RECS)];
+};
+
+/**
+ * Instant suggestions for the wait before the model answers. Every entry has to
+ * be defensible for *this* page, so only an existing home for the domain and
+ * folders whose names match the page qualify.
+ */
+export const heuristicRecommendations = ({ url, title, domainMap, folderPaths }) => {
+  const domain = hostnameOf(url);
+  const recs = [];
+  const push = (path, source) => {
+    if (!path || path === 'Root') return;
+    if (recs.some((item) => item.text.toLowerCase() === path.toLowerCase())) return;
+    recs.push({
+      add_folder: false,
+      text: path,
+      title: title || domain || 'Bookmark',
+      source,
+    });
+  };
+
+  push(domainMap?.[domain], 'domain');
+  relevantFolderPaths({ url, title, folderPaths }).forEach((path) => push(path, 'name-match'));
+  return recs.slice(0, 3);
+};
+
+export const getBookmarkRecommendations = async ({
+  config,
+  folderStructure,
+  url,
+  title,
+  structureSummary = '',
+  domainMap = {},
+  folderPaths = [],
+  onDownloadProgress,
+}) => {
+  const [profile, history] = await Promise.all([loadOrganizationProfile(), loadPlacementHistory()]);
+  const domain = hostnameOf(url);
+
+  // Placements the user accepted outrank the map derived from the tree.
+  const knownFolders = { ...domainMap, ...(profile.domainMap || {}) };
+
+  // The mapping for this domain is the single most useful hint, so it leads.
+  const domainLines = [
+    ...(knownFolders[domain] ? [`${domain} -> ${knownFolders[domain]}`] : []),
+    ...Object.entries(knownFolders)
+      .filter(([key]) => key !== domain)
+      .map(([key, path]) => `${key} -> ${path}`),
+  ].join('\n');
+
+  const examples = history.slice(0, 8)
+    .map((item) => `- ${item.url} -> ${item.path}`)
+    .join('\n');
+
+  const render = (budgetChars) => renderSections(
+    [
+      { label: 'Bookmark:', body: `URL: ${url}\nPage title: ${title || '(none)'}`, required: true },
+      { label: 'Library summary:', body: structureSummary, weight: 1 },
+      { label: 'Known domain -> folder:', body: domainLines, weight: 1 },
+      { label: 'Recent accepted placements:', body: examples, weight: 1 },
+      { label: 'Folder structure:', body: folderStructure, weight: 6 },
+    ],
+    budgetChars,
+  );
+
+  const json = await completeJson({
+    config,
+    system: RECOMMEND_SYSTEM,
+    prompt: render,
+    schema: recommendSchema,
+    onDownloadProgress,
+  });
+
+  // A thin or malformed response degrades into local suggestions rather than
+  // an error, so the popup always has something actionable.
+  const valid = (json.recommendations || [])
+    .filter((rec) => typeof rec.add_folder === 'boolean' && rec.text && rec.title)
+    .map((rec) => ({ ...rec, source: 'ai' }));
+
+  return ensureRecommendationMix(valid, {
+    url,
+    title,
+    domainMap: knownFolders,
+    folderPaths,
+  });
 };
